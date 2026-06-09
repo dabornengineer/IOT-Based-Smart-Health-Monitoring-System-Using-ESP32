@@ -241,7 +241,7 @@ void initMAX30102(void)
 //    5. SensorData_t struct — all sensor state in one place
 // ─────────────────────────────────────────────────────────────
 
-#include "freertos/FreeRTOS.h"
+/*#include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <Wire.h>
 #include <Arduino.h>
@@ -258,7 +258,7 @@ void initMAX30102(void)
 #define TRIM_DROP           1            // drop this many from each end (trimmed mean)
 #define TRIM_KEEP           (AVERAGE_COUNT - 2 * TRIM_DROP)  // = 5 used in average
 
-#define MIN_IR_THRESHOLD    30000UL      // minimum IR value for a valid finger contact
+#define MIN_IR_THRESHOLD    10000UL      // minimum IR value for a valid finger contact
                                          // raise if you get false "finger present" readings;
                                          // lower if a firm press still triggers weak-signal
 
@@ -453,6 +453,509 @@ void sp02Reading(void *pvParameters)
             Serial.print  (TRIM_DROP);
             Serial.println(" outlier(s) dropped each end)");
             Serial.println("──────────────────────────");
+
+            readingIndex = 0;   // start next batch immediately
+        }
+    }
+}*/
+
+// ─────────────────────────────────────────────────────────────
+//  max30102.cpp  —  SpO2 / Heart-rate reader (v3 - stable)
+//
+//  Core fixes in this version:
+//    1. Sample config changed to 400sps / avg16 = 25 effective sps
+//       This gives the ADC much cleaner raw data to work with.
+//    2. SPO2_MIN raised to 80 — rejects physiologically impossible values
+//    3. Batch variance check — if readings in a batch are too spread
+//       out, the batch is discarded and restarted rather than averaged.
+//    4. consecValid raised to 3 — algorithm must agree 3 cycles in a row.
+//    5. Finger-loss hysteresis — IR must drop below threshold for
+//       3 consecutive cycles before declaring finger absent.
+//       Prevents a single noisy sample from resetting progress.
+// ─────────────────────────────────────────────────────────────
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include <Wire.h>
+#include <Arduino.h>
+#include "MAX30105.h"
+#include "spo2_algorithm.h"
+#include "max30102.h"
+
+// ── Buffer constants ──────────────────────────────────────────
+#define BUFFER_LENGTH       100
+#define SHIFT_AMOUNT        25
+#define REFILL_START        (BUFFER_LENGTH - SHIFT_AMOUNT)
+
+// ── Averaging ─────────────────────────────────────────────────
+#define AVERAGE_COUNT       7
+#define TRIM_DROP           1
+#define TRIM_KEEP           (AVERAGE_COUNT - 2 * TRIM_DROP)   // 5
+
+// ── Stability thresholds ──────────────────────────────────────
+#define CONSEC_VALID_NEEDED 3      // algo must agree 3 cycles before recording
+#define FINGER_LOSS_COUNT   3      // IR must be weak for 3 cycles to confirm removal
+#define SPO2_VARIANCE_MAX   8      // reject batch if max-min SpO2 spread > 8 %
+#define HR_VARIANCE_MAX     25     // reject batch if max-min HR spread > 25 bpm
+
+// ── Physiological sanity bounds ───────────────────────────────
+// 80 % floor kills the 74 % / 66 % garbage readings entirely
+#define SPO2_MIN   80
+#define SPO2_MAX   100
+#define HR_MIN     40
+#define HR_MAX     180
+
+// ── IR finger-detection threshold ────────────────────────────
+// Tuned for ADC_RANGE=4096, ledBrightness=60
+// If you still get false "no finger": lower to 5000
+// If you get false "finger present": raise to 10000
+#define MIN_IR_THRESHOLD    7000UL
+
+// ── Sensor config ─────────────────────────────────────────────
+// 400 sps / average-16 = 25 effective sps fed to algorithm.
+// Higher oversampling = cleaner AC/DC ratio = stable validSPO2.
+/*#define ledBrightness       60
+#define MY_SAMPLE_AVERAGE   16     // was 4
+#define MY_LED_MODE         2
+#define MY_SAMPLE_RATE      400    // was 100
+#define MY_PULSE_WIDTH      411
+#define MY_ADC_RANGE        4096
+
+// ── Sensor state ──────────────────────────────────────────────
+typedef struct {
+    uint32_t irBuffer[BUFFER_LENGTH];
+    uint32_t redBuffer[BUFFER_LENGTH];
+    int32_t  bufferLength;
+    int32_t  spo2;
+    int8_t   validSPO2;
+    int32_t  heartRate;
+    int8_t   validHeartRate;
+} SensorData_t;
+
+static SensorData_t sd;
+MAX30105 particleSensor;
+
+// ── Helpers ───────────────────────────────────────────────────
+static void sortArray(int32_t *arr, int n)
+{
+    for (int i = 1; i < n; i++) {
+        int32_t key = arr[i];
+        int j = i - 1;
+        while (j >= 0 && arr[j] > key) { arr[j+1] = arr[j]; j--; }
+        arr[j+1] = key;
+    }
+}
+
+static int32_t trimmedMean(int32_t *src, int n)
+{
+    int32_t tmp[AVERAGE_COUNT];
+    memcpy(tmp, src, n * sizeof(int32_t));
+    sortArray(tmp, n);
+    int64_t sum = 0;
+    for (int i = TRIM_DROP; i < n - TRIM_DROP; i++) sum += tmp[i];
+    return (int32_t)(sum / TRIM_KEEP);
+}
+
+static bool physiologicallyValid(int32_t spo2, int32_t hr)
+{
+    return (spo2 >= SPO2_MIN && spo2 <= SPO2_MAX &&
+            hr   >= HR_MIN   && hr   <= HR_MAX);
+}
+
+// Returns true if the batch is too noisy to trust
+static bool batchTooNoisy(int32_t *spo2Arr, int32_t *hrArr, int n)
+{
+    int32_t sMin = spo2Arr[0], sMax = spo2Arr[0];
+    int32_t hMin = hrArr[0],   hMax = hrArr[0];
+    for (int i = 1; i < n; i++) {
+        if (spo2Arr[i] < sMin) sMin = spo2Arr[i];
+        if (spo2Arr[i] > sMax) sMax = spo2Arr[i];
+        if (hrArr[i]   < hMin) hMin = hrArr[i];
+        if (hrArr[i]   > hMax) hMax = hrArr[i];
+    }
+    bool spo2Noisy = (sMax - sMin) > SPO2_VARIANCE_MAX;
+    bool hrNoisy   = (hMax - hMin) > HR_VARIANCE_MAX;
+
+    if (spo2Noisy || hrNoisy) {
+        Serial.print("Batch rejected — spread too wide: SpO2 ");
+        Serial.print(sMax - sMin);
+        Serial.print("%, HR ");
+        Serial.print(hMax - hMin);
+        Serial.println(" bpm. Hold still and retry.");
+        return true;
+    }
+    return false;
+}
+
+// ── Init ──────────────────────────────────────────────────────
+void initMAX30102(void)
+{
+    Wire.begin();
+    while (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+        Serial.println("MAX30102 not found — check wiring/power.");
+        vTaskDelay(pdMS_TO_TICKS(800));
+    }
+    Serial.println("Sensor ready. Attach finger with rubber band.");
+    particleSensor.setup(
+        ledBrightness, MY_SAMPLE_AVERAGE, MY_LED_MODE,
+        MY_SAMPLE_RATE, MY_PULSE_WIDTH, MY_ADC_RANGE);
+    sd.bufferLength = BUFFER_LENGTH;
+}
+
+// ── Main task ─────────────────────────────────────────────────
+void sp02Reading(void *pvParameters)
+{
+    int32_t spo2Readings[AVERAGE_COUNT];
+    int32_t hrReadings[AVERAGE_COUNT];
+    int     readingIndex    = 0;
+    bool    fingerWasAbsent = true;
+    int     consecValid     = 0;
+    int     fingerLossCount = 0;   // hysteresis counter for finger removal
+
+    // ── Fill initial buffer ────────────────────────────────────
+    Serial.println("Filling initial buffer...");
+    for (byte i = 0; i < BUFFER_LENGTH; i++) {
+        while (!particleSensor.available()) {
+            particleSensor.check();
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+        sd.redBuffer[i] = particleSensor.getRed();
+        sd.irBuffer[i]  = particleSensor.getIR();
+        particleSensor.nextSample();
+    }
+
+    maxim_heart_rate_and_oxygen_saturation(
+        sd.irBuffer, sd.bufferLength, sd.redBuffer,
+        &sd.spo2, &sd.validSPO2, &sd.heartRate, &sd.validHeartRate);
+
+    // ── Main loop ──────────────────────────────────────────────
+    while (1)
+    {
+        // Shift + refill buffer
+        for (byte i = SHIFT_AMOUNT; i < BUFFER_LENGTH; i++) {
+            sd.redBuffer[i - SHIFT_AMOUNT] = sd.redBuffer[i];
+            sd.irBuffer[i  - SHIFT_AMOUNT] = sd.irBuffer[i];
+        }
+        for (byte i = REFILL_START; i < BUFFER_LENGTH; i++) {
+            while (!particleSensor.available())
+                particleSensor.check();
+            sd.redBuffer[i] = particleSensor.getRed();
+            sd.irBuffer[i]  = particleSensor.getIR();
+            particleSensor.nextSample();
+        }
+
+        maxim_heart_rate_and_oxygen_saturation(
+            sd.irBuffer, sd.bufferLength, sd.redBuffer,
+            &sd.spo2, &sd.validSPO2, &sd.heartRate, &sd.validHeartRate);
+
+        // ── GATE 1: IR threshold with hysteresis ──────────────
+        uint32_t irValue = sd.irBuffer[BUFFER_LENGTH - 1];
+
+        if (irValue < MIN_IR_THRESHOLD) {
+            fingerLossCount++;
+            if (fingerLossCount >= FINGER_LOSS_COUNT) {
+                // Confirmed finger removal
+                if (!fingerWasAbsent) {
+                    Serial.println("Finger removed.");
+                }
+                Serial.println("No finger detected — place finger on sensor.");
+                readingIndex    = 0;
+                consecValid     = 0;
+                fingerWasAbsent = true;
+                fingerLossCount = FINGER_LOSS_COUNT; // clamp, don't keep growing
+            } else {
+                // IR dipped but not confirmed yet — hold current state
+                Serial.print("IR dip (");
+                Serial.print(fingerLossCount);
+                Serial.print("/");
+                Serial.print(FINGER_LOSS_COUNT);
+                Serial.println(") — hold still...");
+            }
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+
+        // IR is strong — finger is present
+        fingerLossCount = 0;
+
+        if (fingerWasAbsent) {
+            Serial.println("Finger detected — acquiring readings, please hold still...");
+            fingerWasAbsent = false;
+            readingIndex    = 0;
+            consecValid     = 0;
+        }
+
+        // ── GATE 2: Algorithm validity + physiological sanity ──
+        bool algoValid = (sd.validSPO2     == 1 &&
+                          sd.validHeartRate == 1 &&
+                          physiologicallyValid(sd.spo2, sd.heartRate));
+
+        if (!algoValid) {
+            consecValid = 0;
+            // Only print every 3rd invalid cycle to reduce noise
+            static int invalidPrintCount = 0;
+            if (++invalidPrintCount >= 3) {
+                Serial.println("Stabilising algorithm — keep finger still...");
+                invalidPrintCount = 0;
+            }
+            continue;
+        }
+
+        // ── GATE 3: Consecutive-valid guard ───────────────────
+        consecValid++;
+        if (consecValid < CONSEC_VALID_NEEDED) {
+            Serial.print("Confirming stable reading (");
+            Serial.print(consecValid);
+            Serial.print("/");
+            Serial.print(CONSEC_VALID_NEEDED);
+            Serial.println(")...");
+            continue;
+        }
+        consecValid = 0;
+
+        // ── Record reading ────────────────────────────────────
+        spo2Readings[readingIndex] = sd.spo2;
+        hrReadings[readingIndex]   = sd.heartRate;
+        readingIndex++;
+
+        Serial.print("Reading ");
+        Serial.print(readingIndex);
+        Serial.print(" / ");
+        Serial.print(AVERAGE_COUNT);
+        Serial.print("  →  SpO2: ");
+        Serial.print(sd.spo2);
+        Serial.print(" %   HR: ");
+        Serial.print(sd.heartRate);
+        Serial.println(" bpm");
+
+        // ── Output when batch is full ─────────────────────────
+        if (readingIndex >= AVERAGE_COUNT)
+        {
+            if (batchTooNoisy(spo2Readings, hrReadings, AVERAGE_COUNT)) {
+                // Batch rejected — discard and restart
+                readingIndex = 0;
+                consecValid  = 0;
+            } else {
+                int32_t avgSpo2 = trimmedMean(spo2Readings, AVERAGE_COUNT);
+                int32_t avgHR   = trimmedMean(hrReadings,   AVERAGE_COUNT);
+
+                Serial.println("══════════════════════════════");
+                Serial.print  ("  SpO2       : ");
+                Serial.print  (avgSpo2);
+                Serial.println(" %");
+                Serial.print  ("  Heart Rate : ");
+                Serial.print  (avgHR);
+                Serial.println(" bpm");
+                Serial.println("══════════════════════════════");
+
+                readingIndex = 0;
+            }
+        }
+    }
+}*/
+
+// ─────────────────────────────────────────────────────────────
+//  max30102.cpp  —  SpO2 / Heart-rate reader
+//
+//  Logic:
+//    - Collect readings continuously while finger is present
+//    - Only COUNT a reading if SpO2 >= 90 %
+//    - Once 5 valid (>=90%) readings are collected, average them
+//    - HR is averaged from the same 5 accepted readings
+// ─────────────────────────────────────────────────────────────
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include <Wire.h>
+#include <Arduino.h>
+#include "MAX30105.h"
+#include "spo2_algorithm.h"
+#include "max30102.h"
+
+// ── Buffer constants ──────────────────────────────────────────
+#define BUFFER_LENGTH       100
+#define SHIFT_AMOUNT        25
+#define REFILL_START        (BUFFER_LENGTH - SHIFT_AMOUNT)   // 75
+
+// ── Reading collection ────────────────────────────────────────
+#define READINGS_NEEDED     5       // collect this many valid readings
+#define SPO2_ACCEPT_MIN     90      // only accept readings >= this value
+
+// ── Finger detection ──────────────────────────────────────────
+#define MIN_IR_THRESHOLD    7000UL
+#define FINGER_LOSS_COUNT   3       // IR must be weak 3 cycles to confirm removal
+
+// ── HR sanity bounds (SpO2 bounds replaced by SPO2_ACCEPT_MIN) ─
+#define HR_MIN   40
+#define HR_MAX   180
+
+// ── Sensor config ─────────────────────────────────────────────
+#define ledBrightness       60
+#define MY_SAMPLE_AVERAGE   16
+#define MY_LED_MODE         2
+#define MY_SAMPLE_RATE      400
+#define MY_PULSE_WIDTH      411
+#define MY_ADC_RANGE        4096
+
+// ── Sensor state ──────────────────────────────────────────────
+typedef struct {
+    uint32_t irBuffer[BUFFER_LENGTH];
+    uint32_t redBuffer[BUFFER_LENGTH];
+    int32_t  bufferLength;
+    int32_t  spo2;
+    int8_t   validSPO2;
+    int32_t  heartRate;
+    int8_t   validHeartRate;
+} SensorData_t;
+
+static SensorData_t sd;
+MAX30105 particleSensor;
+
+// ── Init ──────────────────────────────────────────────────────
+void initMAX30102(void)
+{
+    Wire.begin();
+    while (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+        Serial.println("MAX30102 not found — check wiring/power.");
+        vTaskDelay(pdMS_TO_TICKS(800));
+    }
+    Serial.println("Sensor ready. Attach finger with rubber band.");
+    particleSensor.setup(
+        ledBrightness, MY_SAMPLE_AVERAGE, MY_LED_MODE,
+        MY_SAMPLE_RATE, MY_PULSE_WIDTH, MY_ADC_RANGE);
+    sd.bufferLength = BUFFER_LENGTH;
+}
+
+// ── Main task ─────────────────────────────────────────────────
+void sp02Reading(void *pvParameters)
+{
+    int32_t spo2Readings[READINGS_NEEDED];
+    int32_t hrReadings[READINGS_NEEDED];
+    int     readingIndex    = 0;
+    bool    fingerWasAbsent = true;
+    int     fingerLossCount = 0;
+
+    // ── Fill initial buffer ────────────────────────────────────
+    Serial.println("Filling initial buffer...");
+    for (byte i = 0; i < BUFFER_LENGTH; i++) {
+        while (!particleSensor.available()) {
+            particleSensor.check();
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+        sd.redBuffer[i] = particleSensor.getRed();
+        sd.irBuffer[i]  = particleSensor.getIR();
+        particleSensor.nextSample();
+    }
+
+    maxim_heart_rate_and_oxygen_saturation(
+        sd.irBuffer, sd.bufferLength, sd.redBuffer,
+        &sd.spo2, &sd.validSPO2, &sd.heartRate, &sd.validHeartRate);
+
+    // ── Main loop ──────────────────────────────────────────────
+    while (1)
+    {
+        // Shift + refill
+        for (byte i = SHIFT_AMOUNT; i < BUFFER_LENGTH; i++) {
+            sd.redBuffer[i - SHIFT_AMOUNT] = sd.redBuffer[i];
+            sd.irBuffer[i  - SHIFT_AMOUNT] = sd.irBuffer[i];
+        }
+        for (byte i = REFILL_START; i < BUFFER_LENGTH; i++) {
+            while (!particleSensor.available())
+                particleSensor.check();
+            sd.redBuffer[i] = particleSensor.getRed();
+            sd.irBuffer[i]  = particleSensor.getIR();
+            particleSensor.nextSample();
+        }
+
+        maxim_heart_rate_and_oxygen_saturation(
+            sd.irBuffer, sd.bufferLength, sd.redBuffer,
+            &sd.spo2, &sd.validSPO2, &sd.heartRate, &sd.validHeartRate);
+
+        // ── GATE 1: Finger detection with hysteresis ──────────
+        uint32_t irValue = sd.irBuffer[BUFFER_LENGTH - 1];
+
+        if (irValue < MIN_IR_THRESHOLD) {
+            fingerLossCount++;
+            if (fingerLossCount >= FINGER_LOSS_COUNT) {
+                if (!fingerWasAbsent) {
+                    Serial.println("Finger removed — resetting.");
+                }
+                Serial.println("No finger detected — place finger on sensor.");
+                readingIndex    = 0;
+                fingerWasAbsent = true;
+                fingerLossCount = FINGER_LOSS_COUNT; // clamp
+            }
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+
+        // IR strong — finger present
+        fingerLossCount = 0;
+
+        if (fingerWasAbsent) {
+            Serial.println("Finger detected — hold still, collecting readings...");
+            fingerWasAbsent = false;
+            readingIndex    = 0;
+        }
+
+        // ── GATE 2: Algorithm must be valid ───────────────────
+        bool algoValid = (sd.validSPO2      == 1 &&
+                          sd.validHeartRate  == 1 &&
+                          sd.heartRate >= HR_MIN  &&
+                          sd.heartRate <= HR_MAX);
+
+        if (!algoValid) {
+            // Don't print every cycle — only occasionally
+            static uint8_t waitPrintThrottle = 0;
+            if (++waitPrintThrottle >= 4) {
+                Serial.println("Waiting for stable signal...");
+                waitPrintThrottle = 0;
+            }
+            continue;
+        }
+
+        // ── GATE 3: Only accept SpO2 >= 90% ──────────────────
+        if (sd.spo2 < SPO2_ACCEPT_MIN) {
+            Serial.print("Reading discarded (SpO2 ");
+            Serial.print(sd.spo2);
+            Serial.println("% < 90%) — adjust finger position.");
+            continue;   // not counted, readingIndex unchanged
+        }
+
+        // ── Valid reading: record it ──────────────────────────
+        spo2Readings[readingIndex] = sd.spo2;
+        hrReadings[readingIndex]   = sd.heartRate;
+        readingIndex++;
+
+        Serial.print("Accepted reading ");
+        Serial.print(readingIndex);
+        Serial.print(" / ");
+        Serial.print(READINGS_NEEDED);
+        Serial.print("  →  SpO2: ");
+        Serial.print(sd.spo2);
+        Serial.print("%   HR: ");
+        Serial.print(sd.heartRate);
+        Serial.println(" bpm");
+
+        // ── Once 5 valid readings collected: average and output
+        if (readingIndex >= READINGS_NEEDED)
+        {
+            int32_t sumSpo2 = 0, sumHR = 0;
+            for (int i = 0; i < READINGS_NEEDED; i++) {
+                sumSpo2 += spo2Readings[i];
+                sumHR   += hrReadings[i];
+            }
+            int32_t avgSpo2 = sumSpo2 / READINGS_NEEDED;
+            int32_t avgHR   = sumHR   / READINGS_NEEDED;
+
+            Serial.println("══════════════════════════════");
+            Serial.print  ("  SpO2       : ");
+            Serial.print  (avgSpo2);
+            Serial.println(" %");
+            Serial.print  ("  Heart Rate : ");
+            Serial.print  (avgHR);
+            Serial.println(" bpm");
+            Serial.println("══════════════════════════════");
 
             readingIndex = 0;   // start next batch immediately
         }

@@ -13,6 +13,7 @@
 
 static void sortArray(int32_t *arr, int n);
 static int32_t trimmedMean(int32_t *src, int n);
+static bool physiologicallyValid(int32_t spo2, int32_t hr);
 void initMAX30102(void);
 void sp02Reading(void *pvParameters);
 

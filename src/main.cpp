@@ -13,7 +13,7 @@ extern "C" void app_main(void)
     initAd8232();
     initMAX30102();
 
-    xTaskCreate(readAd8232Values, "ECG_Task", 8192, NULL, 1, NULL);
-    //xTaskCreate(sp02Reading, "Sp02 Reading", 10240, NULL, 2, NULL);
+    //xTaskCreate(readAd8232Values, "ECG_Task", 8192, NULL, 1, NULL);
+    xTaskCreate(sp02Reading, "Sp02 Reading", 10240, NULL, 2, NULL);
 
 }

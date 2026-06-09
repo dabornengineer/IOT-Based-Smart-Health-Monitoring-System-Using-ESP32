@@ -26,7 +26,18 @@ void readAd8232Values(void *pvParameters)
 
         }
         value = analogRead(OUTPUT_AD8232);
+
+        //Serial.print("UL:");
+        //Serial.print(4095);
+        //Serial.print(",");
+
+        Serial.print("AD8232:");
         Serial.println(value);
+        //Serial.print(",");
+
+        //Serial.print("LL:");
+        //Serial.println(2300);
+
         vTaskDelay(pdMS_TO_TICKS(4));
     }
 }
