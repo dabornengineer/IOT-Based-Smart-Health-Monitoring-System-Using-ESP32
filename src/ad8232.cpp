@@ -7,7 +7,9 @@ void initAd8232(void)
 {
     pinMode(NOT_CONNECTED_RIGHT, INPUT);
     pinMode(NOT_CONNECTED_LEFT, INPUT);
-    pinMode(OUTPUT_AD8232, INPUT);
+    //pinMode(OUTPUT_AD8232, INPUT);
+
+    analogSetPinAttenuation(OUTPUT_AD8232, ADC_11db);  // 0–3.3V range
 }
 
 void readAd8232Values(void *pvParameters)
