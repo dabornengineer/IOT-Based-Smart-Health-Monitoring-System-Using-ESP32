@@ -764,7 +764,7 @@ void sp02Reading(void *pvParameters)
 //    - HR is averaged from the same 5 accepted readings
 // ─────────────────────────────────────────────────────────────
 
-#include "freertos/FreeRTOS.h"
+/*#include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <Wire.h>
 #include <Arduino.h>
@@ -958,6 +958,189 @@ void sp02Reading(void *pvParameters)
             Serial.println("══════════════════════════════");
 
             readingIndex = 0;   // start next batch immediately
+        }
+    }
+}*/
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include <Wire.h>
+#include <Arduino.h>
+#include "MAX30105.h"
+#include "spo2_algorithm.h"
+#include "max30102.h"
+#include "display.h"   // ← shared globals
+
+#define BUFFER_LENGTH       100
+#define SHIFT_AMOUNT        25
+#define REFILL_START        (BUFFER_LENGTH - SHIFT_AMOUNT)
+
+#define READINGS_NEEDED     5
+#define SPO2_ACCEPT_MIN     90
+
+#define MIN_IR_THRESHOLD    7000UL
+#define FINGER_LOSS_COUNT   3
+
+#define HR_MIN   40
+#define HR_MAX   180
+
+#define ledBrightness       60
+#define MY_SAMPLE_AVERAGE   16
+#define MY_LED_MODE         2
+#define MY_SAMPLE_RATE      400
+#define MY_PULSE_WIDTH      411
+#define MY_ADC_RANGE        4096
+
+typedef struct {
+    uint32_t irBuffer[BUFFER_LENGTH];
+    uint32_t redBuffer[BUFFER_LENGTH];
+    int32_t  bufferLength;
+    int32_t  spo2;
+    int8_t   validSPO2;
+    int32_t  heartRate;
+    int8_t   validHeartRate;
+} SensorData_t;
+
+static SensorData_t sd;
+MAX30105 particleSensor;
+
+void initMAX30102(void)
+{
+    // Note: Wire.begin() is called inside initDisplay() with custom pins.
+    // If display is NOT used, uncomment: Wire.begin();
+    while (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+        Serial.println("MAX30102 not found — check wiring/power.");
+        vTaskDelay(pdMS_TO_TICKS(800));
+    }
+    Serial.println("MAX30102 ready. Attach finger with rubber band.");
+    particleSensor.setup(
+        ledBrightness, MY_SAMPLE_AVERAGE, MY_LED_MODE,
+        MY_SAMPLE_RATE, MY_PULSE_WIDTH, MY_ADC_RANGE);
+    sd.bufferLength = BUFFER_LENGTH;
+}
+
+void sp02Reading(void *pvParameters)
+{
+    int32_t spo2Readings[READINGS_NEEDED];
+    int32_t hrReadings[READINGS_NEEDED];
+    int     readingIndex    = 0;
+    bool    fingerWasAbsent = true;
+    int     fingerLossCount = 0;
+
+    Serial.println("Filling initial buffer...");
+    for (byte i = 0; i < BUFFER_LENGTH; i++) {
+        while (!particleSensor.available()) {
+            particleSensor.check();
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+        sd.redBuffer[i] = particleSensor.getRed();
+        sd.irBuffer[i]  = particleSensor.getIR();
+        particleSensor.nextSample();
+    }
+
+    maxim_heart_rate_and_oxygen_saturation(
+        sd.irBuffer, sd.bufferLength, sd.redBuffer,
+        &sd.spo2, &sd.validSPO2, &sd.heartRate, &sd.validHeartRate);
+
+    while (1)
+    {
+        for (byte i = SHIFT_AMOUNT; i < BUFFER_LENGTH; i++) {
+            sd.redBuffer[i - SHIFT_AMOUNT] = sd.redBuffer[i];
+            sd.irBuffer[i  - SHIFT_AMOUNT] = sd.irBuffer[i];
+        }
+        for (byte i = REFILL_START; i < BUFFER_LENGTH; i++) {
+            while (!particleSensor.available()) particleSensor.check();
+            sd.redBuffer[i] = particleSensor.getRed();
+            sd.irBuffer[i]  = particleSensor.getIR();
+            particleSensor.nextSample();
+        }
+
+        maxim_heart_rate_and_oxygen_saturation(
+            sd.irBuffer, sd.bufferLength, sd.redBuffer,
+            &sd.spo2, &sd.validSPO2, &sd.heartRate, &sd.validHeartRate);
+
+        uint32_t irValue = sd.irBuffer[BUFFER_LENGTH - 1];
+
+        if (irValue < MIN_IR_THRESHOLD) {
+            fingerLossCount++;
+            if (fingerLossCount >= FINGER_LOSS_COUNT) {
+                if (!fingerWasAbsent) Serial.println("Finger removed — resetting.");
+                Serial.println("No finger detected.");
+
+                // ── Update display globals ────────────────
+                g_fingerOn = false;
+                g_spo2     = -1;
+                g_hr       = -1;
+
+                readingIndex    = 0;
+                fingerWasAbsent = true;
+                fingerLossCount = FINGER_LOSS_COUNT;
+            }
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+
+        fingerLossCount = 0;
+        g_fingerOn = true;  // ← finger present
+
+        if (fingerWasAbsent) {
+            Serial.println("Finger detected — collecting readings...");
+            fingerWasAbsent = false;
+            readingIndex    = 0;
+        }
+
+        bool algoValid = (sd.validSPO2     == 1 &&
+                          sd.validHeartRate == 1 &&
+                          sd.heartRate >= HR_MIN  &&
+                          sd.heartRate <= HR_MAX);
+
+        if (!algoValid) {
+            static uint8_t waitThrottle = 0;
+            if (++waitThrottle >= 4) {
+                Serial.println("Waiting for stable signal...");
+                waitThrottle = 0;
+            }
+            continue;
+        }
+
+        if (sd.spo2 < SPO2_ACCEPT_MIN) {
+            Serial.print("Reading discarded (SpO2 ");
+            Serial.print(sd.spo2);
+            Serial.println("% < 90%)");
+            continue;
+        }
+
+        spo2Readings[readingIndex] = sd.spo2;
+        hrReadings[readingIndex]   = sd.heartRate;
+        readingIndex++;
+
+        Serial.print("Accepted reading ");
+        Serial.print(readingIndex); Serial.print("/");
+        Serial.print(READINGS_NEEDED);
+        Serial.print("  SpO2:"); Serial.print(sd.spo2);
+        Serial.print("%  HR:");  Serial.print(sd.heartRate);
+        Serial.println(" bpm");
+
+        if (readingIndex >= READINGS_NEEDED)
+        {
+            int32_t sumSpo2 = 0, sumHR = 0;
+            for (int i = 0; i < READINGS_NEEDED; i++) {
+                sumSpo2 += spo2Readings[i];
+                sumHR   += hrReadings[i];
+            }
+            int32_t avgSpo2 = sumSpo2 / READINGS_NEEDED;
+            int32_t avgHR   = sumHR   / READINGS_NEEDED;
+
+            // ── Update display globals ────────────────────
+            g_spo2 = avgSpo2;
+            g_hr   = avgHR;
+
+            Serial.println("══════════════════════════════");
+            Serial.print("  SpO2       : "); Serial.print(avgSpo2); Serial.println(" %");
+            Serial.print("  Heart Rate : "); Serial.print(avgHR);   Serial.println(" bpm");
+            Serial.println("══════════════════════════════");
+
+            readingIndex = 0;
         }
     }
 }

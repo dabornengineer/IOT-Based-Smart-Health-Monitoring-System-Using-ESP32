@@ -4,6 +4,7 @@
 #include "ad8232.h"
 #include "max30102.h"
 #include "ds18b20.h"
+#include "display.h"
 #include "esp_log.h"
 
 extern "C" void app_main(void)
@@ -11,11 +12,14 @@ extern "C" void app_main(void)
     initArduino();
     Serial.begin(115200);
     esp_log_level_set("gpio", ESP_LOG_NONE);
-    //initAd8232();
+
+    initAd8232();
     initMAX30102();
     initDs18b20();
+    initDisplay();
 
-    //xTaskCreate(readAd8232Values, "ECG_Task", 8192, NULL, 4, NULL);
+    xTaskCreate(readAd8232Values, "ECG_Task", 8192, NULL, 4, NULL);
     xTaskCreate(sp02Reading, "Sp02 Reading", 10240, NULL, 3, NULL);
     xTaskCreate(ds18b20Readings, "temp reading", 4096, NULL, 1, NULL);
+    xTaskCreate(displayTask, "Display_Task", 12288, NULL, 2, NULL);
 }
