@@ -188,7 +188,7 @@ void ds18b20Readings(void *pvParameters)
         vTaskDelay(pdMS_TO_TICKS(1000)); // 1 second tick
     }
 }*/
-#include <Arduino.h>
+/*#include <Arduino.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <OneWire.h>
@@ -337,6 +337,161 @@ void ds18b20Readings(void *pvParameters)
                 g_measuring = false;
 
                 vTaskDelay(pdMS_TO_TICKS(3000));
+                state            = IDLE;
+                countdownSeconds = 0;
+                break;
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}*/
+
+#include <Arduino.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include "ds18b20.h"
+#include "display.h"
+
+OneWire oneWire(DS18B20_PIN);
+DallasTemperature sensors(&oneWire);
+
+#define TOUCH_THRESHOLD  20
+#define MEASURE_SECONDS  30   // reduced from 60 to 30
+
+float getOffset(float palmTemp)
+{
+    if      (palmTemp < 28.0f)  return -1;
+    else if (palmTemp < 29.0f)  return 9.0f;
+    else if (palmTemp < 30.0f)  return 8.0f;
+    else if (palmTemp < 31.0f)  return 7.0f;
+    else if (palmTemp < 32.0f)  return 6.0f;
+    else if (palmTemp < 33.0f)  return 5.0f;
+    else if (palmTemp < 34.0f)  return 4.0f;
+    else if (palmTemp < 35.0f)  return 3.0f;
+    else if (palmTemp <= 35.5f) return 2.0f;
+    else                        return -2;
+}
+
+void initDs18b20(void)
+{
+    sensors.begin();
+    if (sensors.getDeviceCount() == 0)
+        Serial.println("ERROR: DS18B20 not detected");
+    else {
+        Serial.print("DS18B20 detected. Count: ");
+        Serial.println(sensors.getDeviceCount());
+    }
+}
+
+void ds18b20Readings(void *pvParameters)
+{
+    float tempC = 0.0f;
+
+    enum State { IDLE, COUNTDOWN, RESULT };
+    State state          = IDLE;
+    int countdownSeconds = 0;
+
+    while (1)
+    {
+        bool isTouched = (touchRead(TOUCH_PIN) < TOUCH_THRESHOLD);
+
+        switch (state)
+        {
+            // ── IDLE ────────────────────────────────────────
+            case IDLE:
+                Serial.println("Touch sensor to measure temperature...");
+
+                g_measuring = false;
+                g_countdown = MEASURE_SECONDS;
+                // NOTE: g_tempReady is NOT cleared here —
+                // last result stays on screen until a new measurement finishes
+
+                if (isTouched)
+                {
+                    state            = COUNTDOWN;
+                    countdownSeconds = 0;
+                    g_measuring      = true;
+                    Serial.println("Hold sensor for 30 seconds...");
+                }
+                break;
+
+            // ── COUNTDOWN ───────────────────────────────────
+            case COUNTDOWN:
+                if (!isTouched)
+                {
+                    Serial.println("Measurement cancelled.");
+                    state            = IDLE;
+                    countdownSeconds = 0;
+                    g_measuring      = false;
+                    // g_tempReady stays true — last result remains visible
+                    break;
+                }
+
+                countdownSeconds++;
+                g_countdown = MEASURE_SECONDS - countdownSeconds;
+
+                Serial.print("Measuring... ");
+                Serial.print(MEASURE_SECONDS - countdownSeconds);
+                Serial.println("s remaining");
+
+                if (countdownSeconds >= MEASURE_SECONDS)
+                {
+                    sensors.requestTemperatures();
+                    tempC = sensors.getTempCByIndex(0);
+
+                    if (tempC == DEVICE_DISCONNECTED_C)
+                    {
+                        Serial.println("ERROR: DS18B20 disconnected");
+                        state            = IDLE;
+                        countdownSeconds = 0;
+                        g_measuring      = false;
+                        break;
+                    }
+                    state = RESULT;
+                }
+                break;
+
+            // ── RESULT ──────────────────────────────────────
+            case RESULT:
+            {
+                float offset = getOffset(tempC);
+
+                if (offset == -1)
+                {
+                    Serial.println("Poor contact — place hand firmly.");
+                    // Don't update g_tempReady — keep showing last good result
+                }
+                else if (offset == -2)
+                {
+                    float coreTemp = tempC + 2.0f;
+                    Serial.println("WARNING: Possible fever!");
+                    Serial.print("Core Temp: "); Serial.print(coreTemp, 1); Serial.println(" C");
+
+                    // Update display globals — previous result replaced immediately
+                    g_palmTemp  = tempC;
+                    g_coreTemp  = coreTemp;
+                    g_tempReady = true;
+                }
+                else
+                {
+                    float coreTemp = tempC + offset;
+                    Serial.print("Palm: "); Serial.print(tempC, 1);
+                    Serial.print(" C | Core: "); Serial.print(coreTemp, 1); Serial.println(" C");
+
+                    // Update display globals
+                    g_palmTemp  = tempC;
+                    g_coreTemp  = coreTemp;
+                    g_tempReady = true;
+                }
+
+                g_measuring = false;
+
+                // Brief pause to show result, then go back to IDLE
+                // Display will keep showing g_tempReady result while idle
+                vTaskDelay(pdMS_TO_TICKS(2000));
                 state            = IDLE;
                 countdownSeconds = 0;
                 break;
