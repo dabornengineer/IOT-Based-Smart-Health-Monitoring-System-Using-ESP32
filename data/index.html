@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="light only">
+<title>Health Monitor</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-icon">&#9829;</div>
+    HealthMonitor
+  </div>
+  <div class="status-pill" id="statusPill">
+    <span class="status-dot"></span>
+    <span class="status-label" id="connLabel">Connecting…</span>
+  </div>
+</header>
+
+<main>
+
+  <div>
+    <div class="page-title">Patient Monitor</div>
+    <div class="page-subtitle">Real-time vitals dashboard</div>
+  </div>
+
+  <!-- ECG Strip -->
+  <section class="ecg-section">
+    <div class="ecg-header">
+      <div class="ecg-title-group">
+        <span class="section-label">ECG Waveform</span>
+        <span class="section-sub">Electrocardiogram — live signal</span>
+      </div>
+      <span class="ecg-badge" id="leadBadge">LEADS OFF</span>
+    </div>
+    <div class="ecg-wrap">
+      <div class="ecg-grid"></div>
+      <canvas id="ecgCanvas"></canvas>
+    </div>
+    <div class="ecg-footer">
+      <span id="bpmInline">-- BPM</span>
+      <span class="ecg-scale">25 mm/s &nbsp;|&nbsp; 10 mm/mV</span>
+    </div>
+  </section>
+
+  <!-- Vitals Row -->
+  <div class="vitals-grid">
+
+    <!-- Heart Rate -->
+    <div class="card" id="cardBpm">
+      <div class="card-top">
+        <span class="card-label">Heart Rate</span>
+        <div class="card-icon">&#9829;</div>
+      </div>
+      <div>
+        <span class="card-value" id="valBpm">--</span><span class="card-unit">BPM</span>
+      </div>
+      <div class="card-sub" id="subBpm">Awaiting signal</div>
+      <div class="card-bar"><div class="card-fill" id="fillBpm"></div></div>
+    </div>
+
+    <!-- SpO2 -->
+    <div class="card" id="cardSpo2">
+      <div class="card-top">
+        <span class="card-label">SpO₂</span>
+        <div class="card-icon">&#128167;</div>
+      </div>
+      <div>
+        <span class="card-value" id="valSpo2">--</span><span class="card-unit">%</span>
+      </div>
+      <div class="card-sub" id="subSpo2">Place finger on sensor</div>
+      <div class="card-bar"><div class="card-fill" id="fillSpo2"></div></div>
+    </div>
+
+    <!-- Body Temp -->
+    <div class="card" id="cardTemp">
+      <div class="card-top">
+        <span class="card-label">Body Temp</span>
+        <div class="card-icon">&#127777;</div>
+      </div>
+      <div>
+        <span class="card-value" id="valTemp">--</span><span class="card-unit">°C</span>
+      </div>
+      <div class="card-sub" id="subTemp">Touch sensor to measure</div>
+    </div>
+
+  </div>
+
+  <!-- Measuring progress (only during countdown) -->
+  <section class="temp-detail" id="tempDetail" style="display:none">
+    <div class="td-progress">
+      <div class="td-bar-wrap">
+        <div class="td-bar-fill" id="tdBarFill"></div>
+      </div>
+      <span class="td-countdown" id="tdCountdown">30s</span>
+    </div>
+  </section>
+
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
