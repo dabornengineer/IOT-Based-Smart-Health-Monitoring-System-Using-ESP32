@@ -60,7 +60,7 @@ extern "C" void app_main(void)
     xTaskCreate(displayTask,      "Display_Task", 12288, NULL, 2, NULL);
     xTaskCreate(ds18b20Readings,  "temp reading", 4096,  NULL, 1, NULL);
 }*/
-#include "freertos/FreeRTOS.h"
+/*#include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <Arduino.h>
 #include "ad8232.h"
@@ -92,4 +92,37 @@ void setup()
 void loop()
 {
     vTaskDelay(portMAX_DELAY);  // park Arduino loop task; FreeRTOS tasks run freely
+}*/
+#include <Arduino.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "ad8232.h"
+#include "max30102.h"
+#include "ds18b20.h"
+#include "display.h"
+#include "webserver.h"
+#include "logger.h"
+#include "esp_log.h"
+
+void setup()
+{
+    Serial.begin(115200);
+    esp_log_level_set("gpio", ESP_LOG_NONE);
+
+    initAd8232();
+    initMAX30102();
+    initDs18b20();
+    initDisplay();
+
+    xTaskCreate(webTask,          "Web_Task",     8192,  NULL, 5, NULL);
+    xTaskCreate(logTask,          "Log_Task",     4096,  NULL, 1, NULL);
+    xTaskCreate(readAd8232Values, "ECG_Task",     8192,  NULL, 4, NULL);
+    xTaskCreate(sp02Reading,      "SPO2_Task",    10240, NULL, 3, NULL);
+    xTaskCreate(displayTask,      "Display_Task", 12288, NULL, 2, NULL);
+    xTaskCreate(ds18b20Readings,  "Temp_Task",    4096,  NULL, 1, NULL);
+}
+
+void loop()
+{
+    vTaskDelay(pdMS_TO_TICKS(portMAX_DELAY));
 }

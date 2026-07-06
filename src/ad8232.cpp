@@ -572,7 +572,7 @@ void readAd8232Values(void *pvParameters)
     }
 }*/
 
-#include "freertos/FreeRTOS.h"
+/*#include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "ad8232.h"
 #include "display.h"    // shared globals
@@ -691,6 +691,180 @@ void readAd8232Values(void *pvParameters)
         {
             Serial.print(",BPM:");
             Serial.println(bpm);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(4));
+    }
+}*/
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "ad8232.h"
+#include "display.h"
+#include "webserver.h"
+#include <Arduino.h>
+
+// ── BPM Config — tuned from 3 real signal datasets ───────────────────────────
+#define WINDOW            4       // BPM after 4 beats (~4 s at 60 BPM)
+#define MIN_RR            333     // 180 BPM max
+#define MAX_RR            1500    // 40 BPM min
+#define DYNAMIC_RATIO     0.55f   // threshold at 55% of range — all 3 datasets: peaks ~4000, baseline ~1700-2200
+#define ADAPT_SAMPLES     500     // 500 × 4ms = 2s — guarantees 2+ beats per window at any HR
+#define PEAK_RESET_RATIO  0.35f   // reset peaked at 35% above min
+#define SETTLE_CYCLES     2       // skip first 2 adapt cycles (2 × 2s = 4s warmup)
+#define SIG_MIN_CLAMP     1000    // all datasets show baseline > 1100 — clamp prevents startup artifact
+#define SIG_RANGE_GUARD   1500    // real ECG range is ~2900-3100; noise only — reject if below this
+
+// ── BPM state ─────────────────────────────────────────────────────────────────
+static unsigned long rrIntervals[WINDOW] = {0};
+static int           rrIndex             = 0;
+static int           rrCount             = 0;
+static unsigned long lastBeat            = 0;
+static bool          lastBeatSet         = false;
+static bool          peaked              = false;
+
+// ── Dynamic threshold state ───────────────────────────────────────────────────
+static int  sampleBuf[ADAPT_SAMPLES];
+static int  sampleIndex  = 0;
+static int  dynThreshold = 2600;   // safe starting value from combined analysis
+static int  sigMin       = 4095;
+static int  sigMax       = 0;
+static int  sigRange     = 0;
+static int  adaptCount   = 0;
+
+static void updateThreshold(int val)
+{
+    if (val < 200) return;   // discard startup glitches
+
+    sampleBuf[sampleIndex++] = val;
+    if (sampleIndex >= ADAPT_SAMPLES)
+    {
+        int lo = 4095, hi = 0;
+        for (int i = 0; i < ADAPT_SAMPLES; i++)
+        {
+            if (sampleBuf[i] < lo) lo = sampleBuf[i];
+            if (sampleBuf[i] > hi) hi = sampleBuf[i];
+        }
+        sigMin   = max(lo, SIG_MIN_CLAMP);   // clamp prevents startup artifact
+        sigMax   = hi;
+        sigRange = sigMax - sigMin;
+        dynThreshold = sigMin + (int)(sigRange * DYNAMIC_RATIO);
+        sampleIndex  = 0;
+        adaptCount++;
+
+        Serial.printf("[ECG] adapt#%d  thr=%d  min=%d  max=%d  range=%d\n",
+                      adaptCount, dynThreshold, sigMin, sigMax, sigRange);
+    }
+}
+
+// ── BPM computation ───────────────────────────────────────────────────────────
+static int computeBPM(unsigned long rr)
+{
+    rrIntervals[rrIndex % WINDOW] = rr;
+    rrIndex++;
+    if (rrCount < WINDOW) rrCount++;
+    if (rrCount < WINDOW) return -1;
+
+    unsigned long sum = 0;
+    for (int i = 0; i < WINDOW; i++) sum += rrIntervals[i];
+    int bpm = (int)(60000UL / (sum / WINDOW));
+    return (bpm >= 40 && bpm <= 180) ? bpm : -1;
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+void initAd8232(void)
+{
+    pinMode(NOT_CONNECTED_RIGHT, INPUT);
+    pinMode(NOT_CONNECTED_LEFT,  INPUT);
+    analogSetPinAttenuation(OUTPUT_AD8232, ADC_11db);
+}
+
+// ── Task ──────────────────────────────────────────────────────────────────────
+void readAd8232Values(void *pvParameters)
+{
+    int           value         = 0;
+    unsigned long refractoryEnd = 0;
+
+    while (1)
+    {
+        // ── Lead-off ─────────────────────────────────────────────────────────
+        if (digitalRead(NOT_CONNECTED_RIGHT) == HIGH ||
+            digitalRead(NOT_CONNECTED_LEFT)  == HIGH)
+        {
+            if (!g_leadsOff) Serial.println("[ECG] Leads off");
+            g_leadsOff = true;
+            g_bpm      = -1;
+
+            // Full reset
+            rrIndex = rrCount = 0;
+            lastBeat = 0; lastBeatSet = false; peaked = false;
+            sigMin = 4095; sigMax = 0; sigRange = 0;
+            sampleIndex = 0; adaptCount = 0;
+            refractoryEnd = 0;
+            dynThreshold = 2600;
+
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
+        if (g_leadsOff) Serial.println("[ECG] Leads on — warming up...");
+        g_leadsOff = false;
+
+        value = analogRead(OUTPUT_AD8232);
+        pushEcgSample(value);
+        updateThreshold(value);
+
+        unsigned long now = millis();
+
+        // Block peak detection until signal is stable and calibrated
+        if (sigRange < SIG_RANGE_GUARD || adaptCount < SETTLE_CYCLES)
+        {
+            vTaskDelay(pdMS_TO_TICKS(4));
+            continue;
+        }
+
+        if (now > refractoryEnd)
+        {
+            if (value > dynThreshold && !peaked)
+            {
+                peaked = true;
+
+                if (!lastBeatSet)
+                {
+                    lastBeat    = now;
+                    lastBeatSet = true;
+                    Serial.println("[ECG] First beat — waiting for second...");
+                }
+                else
+                {
+                    unsigned long rr = now - lastBeat;
+
+                    if (rr >= MIN_RR && rr <= MAX_RR)
+                    {
+                        lastBeat      = now;
+                        refractoryEnd = now + MIN_RR - 10;
+
+                        int bpm = computeBPM(rr);
+                        if (bpm > 0)
+                        {
+                            g_bpm = bpm;
+                            Serial.printf("[ECG] BPM=%d  RR=%lums\n", bpm, rr);
+                        }
+                    }
+                    else if (rr > MAX_RR)
+                    {
+                        // Gap too long — restart beat tracking
+                        lastBeat = now;
+                        rrIndex = rrCount = 0;
+                        Serial.printf("[ECG] RR too long (%lums) — reset\n", rr);
+                    }
+                    // rr < MIN_RR → noise spike, skip silently
+                }
+            }
+
+            // Reset peaked when signal falls back below 35% of range
+            int resetLevel = sigMin + (int)(sigRange * PEAK_RESET_RATIO);
+            if (value < resetLevel) peaked = false;
         }
 
         vTaskDelay(pdMS_TO_TICKS(4));
